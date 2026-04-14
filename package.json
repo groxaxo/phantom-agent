@@ -1,0 +1,56 @@
+{
+  "name": "phantom-agent",
+  "version": "1.0.0",
+  "description": "Autonomous AI-driven Chrome browser agent with stealth capabilities and MCP support",
+  "type": "module",
+  "main": "dist/phantom-agent.mjs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/groxaxo/phantom-agent.git"
+  },
+  "homepage": "https://github.com/groxaxo/phantom-agent#readme",
+  "bugs": {
+    "url": "https://github.com/groxaxo/phantom-agent/issues"
+  },
+  "keywords": [
+    "browser-automation",
+    "mcp",
+    "chrome",
+    "cdp",
+    "llm",
+    "agent",
+    "opencode",
+    "copilot",
+    "gemini"
+  ],
+  "bin": {
+    "phantom-agent": "dist/phantom-agent.mjs",
+    "phantom-agent-mcp": "dist/phantom-agent-mcp.mjs"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node dist/phantom-agent.mjs",
+    "start:mcp": "node dist/phantom-agent-mcp.mjs",
+    "configure:mcp-clients": "node scripts/configure-mcp-clients.mjs",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "@types/yargs": "^17.0.33",
+    "esbuild": "^0.24.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
