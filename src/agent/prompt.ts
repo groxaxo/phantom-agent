@@ -130,6 +130,13 @@ export function buildUserPrompt(opts: {
   }>;
   browserState: { header: string; content: string; footer: string };
   instructions?: string;
+  /**
+   * When provided (observer model is active), replaces the raw DOM content
+   * in the <browser_state> block with this compact structured summary.
+   * Element indices [N] are preserved by the observer so the actor can
+   * still call click_element_by_index etc.
+   */
+  observerSummary?: string;
 }): string {
   let prompt = '';
 
@@ -166,7 +173,7 @@ export function buildUserPrompt(opts: {
   // Browser state
   prompt += '<browser_state>\n';
   prompt += opts.browserState.header + '\n';
-  prompt += opts.browserState.content + '\n';
+  prompt += (opts.observerSummary ?? opts.browserState.content) + '\n';
   prompt += opts.browserState.footer + '\n';
   prompt += '</browser_state>\n';
 

@@ -31,6 +31,10 @@ export interface BrowserLaunchOptions {
   userAgent?: string;
   timezone?: string;
   locale?: string;
+  /** Connect to the user's real Chrome session (relaunch with debug port if needed) */
+  useRealChrome?: boolean;
+  /** Port for Chrome remote debugging when using real Chrome mode (default: 9222) */
+  remoteDebuggingPort?: number;
 }
 
 export interface StealthConfig {
@@ -97,6 +101,8 @@ export type AgentStatus = 'idle' | 'running' | 'completed' | 'error';
 
 export interface AgentConfig {
   llm: LLMConfig;
+  /** Optional cheap observer model that summarizes raw DOM before the actor sees it */
+  observerLlm?: LLMConfig;
   browser: BrowserLaunchOptions;
   stealth: StealthConfig;
   maxSteps: number;
@@ -183,6 +189,8 @@ export interface AgentStepEvent {
     output: string;
   };
   usage?: TokenUsage;
+  /** Token usage for the observer (cheap summarizer) model, if enabled */
+  observerUsage?: TokenUsage;
 }
 
 export interface TokenUsage {

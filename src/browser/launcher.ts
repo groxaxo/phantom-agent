@@ -2,10 +2,11 @@
  * Chrome process launcher with stealth-optimized flags.
  * Synthesized from playwright's chromiumSwitches + chrome-devtools-mcp's browser.ts.
  */
-import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdirSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { spawn, execSync, type ChildProcess } from 'node:child_process';
+import { mkdirSync, existsSync, readFileSync, rmSync, symlinkSync, lstatSync, readdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
+import http from 'node:http';
 import { logger } from '../utils/logger.js';
 import { WebSocketTransport } from './transport.js';
 import { CDPConnection } from './session.js';
@@ -269,12 +270,17 @@ export async function launchBrowser(
   options: BrowserLaunchOptions,
   stealth: StealthConfig,
 ): Promise<BrowserInstance> {
-  // Mode A: Connect to existing browser
+  // Mode A: Connect to user's real Chrome (relaunch with debug port if needed)
+  if (options.useRealChrome) {
+    return connectToRealChrome(options, stealth);
+  }
+
+  // Mode B: Connect to explicit WebSocket endpoint
   if (options.wsEndpoint) {
     return connectToExisting(options, stealth);
   }
 
-  // Mode B: Launch new process
+  // Mode C: Launch new process
   const installation = resolveChromeInstallation(options.executablePath);
   const execPath = installation.executablePath;
   const { userDataDir, profileDirectory, isEphemeral, usingSystemProfile } = resolveLaunchProfile(
@@ -353,6 +359,312 @@ export async function launchBrowser(
     },
   };
 }
+
+// ─── Real Chrome Mode ────────────────────────────────────────
+
+/**
+ * Create a wrapper directory for Chrome's user-data-dir that symlinks all
+ * contents back to the real profile directory. This tricks Chrome into accepting
+ * the directory as "non-default" while using the real profile data.
+ */
+function createProfileWrapper(realDir: string, wrapperDir: string): string {
+  // Clean up if wrapper already exists
+  if (existsSync(wrapperDir)) {
+    try {
+      const stat = lstatSync(wrapperDir);
+      if (stat.isSymbolicLink()) {
+        rmSync(wrapperDir);
+      } else {
+        rmSync(wrapperDir, { recursive: true, force: true });
+      }
+    } catch { /* ignore */ }
+  }
+
+  mkdirSync(wrapperDir, { recursive: true });
+
+  // Symlink each entry in the real dir into the wrapper
+  const entries = readdirSync(realDir);
+  for (const entry of entries) {
+    const realPath = join(realDir, entry);
+    const wrapperPath = join(wrapperDir, entry);
+    try {
+      symlinkSync(realPath, wrapperPath);
+    } catch (e) {
+      logger.debug('RealChrome', `Could not symlink ${entry}: ${(e as Error).message}`);
+    }
+  }
+
+  return wrapperDir;
+}
+
+/** Fetch Chrome's /json/version endpoint to get the DevTools WebSocket URL */
+async function fetchDebugEndpoint(port: number, timeout = 3000): Promise<string | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), timeout);
+    const req = http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
+      let body = '';
+      res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+      res.on('end', () => {
+        clearTimeout(timer);
+        try {
+          const data = JSON.parse(body) as { webSocketDebuggerUrl?: string };
+          resolve(data.webSocketDebuggerUrl ?? null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => { clearTimeout(timer); resolve(null); });
+  });
+}
+
+/** Wait for Chrome's debugging port to become available after relaunch */
+async function waitForDebugEndpoint(port: number, timeout = 20000): Promise<string> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const wsUrl = await fetchDebugEndpoint(port, 2000);
+    if (wsUrl) return wsUrl;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  throw new Error(`Timed out waiting for Chrome debugging port ${port} (${timeout}ms)`);
+}
+
+/** Check if the user's Chrome (not Playwright/puppeteer) is running */
+function isChromeRunning(): boolean {
+  try {
+    // Match only the main Chrome binary, not child processes or Playwright instances
+    const result = execSync(
+      "ps -eo pid,user,args | grep -E '/opt/google/chrome/chrome|/usr/bin/google-chrome|/usr/bin/chromium' | grep -v grep | grep -v playwright | grep -v puppeteer | awk '{print $1}'",
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ).trim();
+    return result.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Gracefully close the user's Chrome (SIGTERM, then SIGKILL after timeout) */
+async function closeExistingChrome(): Promise<void> {
+  if (!isChromeRunning()) return;
+
+  logger.info('RealChrome', 'Closing existing Chrome instance...');
+  try {
+    // Only kill the user's Chrome processes, not Playwright instances
+    execSync(
+      "ps -eo pid,user,args | grep -E '/opt/google/chrome/chrome|/usr/bin/google-chrome|/usr/bin/chromium' | grep -v grep | grep -v playwright | grep -v puppeteer | awk '{print $1}' | xargs -r kill -TERM 2>/dev/null",
+      { stdio: 'pipe' },
+    );
+  } catch { /* ignore — process may not exist */ }
+
+  // Wait up to 8 seconds for graceful exit
+  const start = Date.now();
+  while (Date.now() - start < 8000) {
+    if (!isChromeRunning()) {
+      logger.info('RealChrome', 'Chrome closed gracefully');
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  // Force kill if still running
+  logger.warn('RealChrome', 'Chrome did not exit gracefully, force-killing...');
+  try {
+    execSync(
+      "ps -eo pid,user,args | grep -E '/opt/google/chrome/chrome|/usr/bin/google-chrome|/usr/bin/chromium' | grep -v grep | grep -v playwright | grep -v puppeteer | awk '{print $1}' | xargs -r kill -9 2>/dev/null",
+      { stdio: 'pipe' },
+    );
+  } catch { /* ignore */ }
+  await new Promise((r) => setTimeout(r, 1000));
+}
+
+/**
+ * Connect to the user's real Chrome browser session.
+ *
+ * Strategy:
+ * 1. Check if Chrome is already running with a debugging port — connect directly
+ * 2. If not, close existing Chrome and relaunch it with --remote-debugging-port
+ *    using the user's real profile (cookies, logins, extensions intact)
+ * 3. Connect via the debugging WebSocket
+ *
+ * This avoids bot detection because:
+ * - Uses the user's real Chrome profile with existing cookies and session data
+ * - No --enable-automation flag
+ * - No --disable-extensions (user's extensions load normally)
+ * - Normal Chrome fingerprint (not a fresh/temp profile)
+ */
+async function connectToRealChrome(
+  options: BrowserLaunchOptions,
+  stealth: StealthConfig,
+): Promise<BrowserInstance> {
+  const port = options.remoteDebuggingPort ?? 9222;
+
+  // Step 1: Try connecting to an already-debuggable Chrome
+  logger.info('RealChrome', `Checking for Chrome debugging port on ${port}...`);
+  let wsUrl = await fetchDebugEndpoint(port);
+
+  if (wsUrl) {
+    logger.info('RealChrome', `Found existing Chrome with debugging on port ${port}`);
+  } else {
+    // Step 2: Need to relaunch Chrome with debugging enabled
+    logger.info('RealChrome', 'No debugging port found. Will relaunch Chrome with remote debugging enabled.');
+
+    await closeExistingChrome();
+
+    // Resolve the Chrome executable
+    const installation = resolveChromeInstallation(options.executablePath);
+    const execPath = installation.executablePath;
+
+    // Resolve the user's REAL profile directory (not ephemeral!)
+    const realUserDataDir = options.userDataDir
+      ?? installation.defaultUserDataDir
+      ?? join(homedir(), '.config/google-chrome');
+
+    if (!existsSync(realUserDataDir)) {
+      throw new Error(
+        `Chrome user data directory not found: ${realUserDataDir}. ` +
+        `Ensure Chrome has been used at least once, or specify --user-data-dir.`
+      );
+    }
+
+    // Chrome refuses --remote-debugging-port when user-data-dir is the default path.
+    // It resolves symlinks, so a simple symlink doesn't work.
+    // Workaround: create a real wrapper directory and symlink each item inside it
+    // to the corresponding item in the real profile dir. Chrome sees a "non-default"
+    // directory path, but all profile data points back to the real data via symlinks.
+    const chromeDefaultDir = installation.defaultUserDataDir ?? join(homedir(), '.config/google-chrome');
+    let userDataDir = realUserDataDir;
+
+    if (realUserDataDir === chromeDefaultDir) {
+      const wrapperPath = join(tmpdir(), 'phantom-chrome-profile');
+      userDataDir = createProfileWrapper(realUserDataDir, wrapperPath);
+      logger.info('RealChrome', `Using wrapper dir ${wrapperPath} with symlinked contents from ${realUserDataDir}`);
+    }
+
+    const profileDir = options.profileDirectory ?? detectLastUsedProfile(realUserDataDir);
+
+    // Build minimal args — keep Chrome as "normal" as possible
+    // We intentionally avoid most automation flags to reduce bot fingerprint
+    const args = [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${userDataDir}`,
+      // Keep the window size consistent
+      `--window-size=${options.viewport.width},${options.viewport.height}`,
+      // These are safe flags that don't affect fingerprinting
+      '--no-first-run',
+      '--no-default-browser-check',
+    ];
+
+    if (profileDir) {
+      args.push(`--profile-directory=${profileDir}`);
+    }
+
+    // Do NOT add: --disable-extensions, --disable-sync, --disable-infobars, etc.
+    // These would alter the fingerprint and potentially break the user's session
+
+    logger.info('RealChrome', `Launching Chrome: ${execPath}`);
+    logger.info('RealChrome', `Profile: ${realUserDataDir}${profileDir ? ` (${profileDir})` : ''}`);
+    logger.info('RealChrome', `Debugging port: ${port}`);
+    logger.debug('RealChrome', `Args: ${args.join(' ')}`);
+
+    const proc = spawn(execPath, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true, // Let Chrome survive if phantom-agent exits
+      env: { ...process.env, DISPLAY: process.env.DISPLAY || ':0' },
+    });
+
+    // Unref so phantom-agent can exit without killing Chrome
+    proc.unref();
+
+    proc.stderr?.on('data', (data: Buffer) => {
+      const line = data.toString().trim();
+      if (line) logger.debug('Chrome', line);
+    });
+
+    // Wait for the debugging port to become available
+    try {
+      wsUrl = await waitForDebugEndpoint(port);
+    } catch (error) {
+      throw new Error(
+        `Failed to start Chrome with debugging port. ${(error as Error).message}\n` +
+        `This may happen if Chrome's profile is locked. Try closing all Chrome windows first.`
+      );
+    }
+  }
+
+  logger.info('RealChrome', `DevTools WebSocket: ${wsUrl}`);
+
+  const transport = await WebSocketTransport.connect(wsUrl);
+  const connection = new CDPConnection(transport);
+
+  // Apply stealth — but with lighter touch for real Chrome mode
+  // We still want CDP detection hiding, but skip user-agent override
+  // since the real Chrome already has a legitimate UA
+  await applyRealChromeStealthSetup(connection, stealth, options);
+
+  return {
+    connection,
+    // No process reference — we don't own the Chrome process in real-chrome mode
+    wsEndpoint: wsUrl,
+    async close() {
+      connection.close();
+      // Intentionally do NOT kill Chrome — user's browser stays open
+      logger.info('RealChrome', 'Disconnected from Chrome (browser stays open)');
+    },
+  };
+}
+
+/**
+ * Lighter stealth setup for real Chrome mode.
+ * We skip user-agent override (real Chrome has legitimate UA) and
+ * skip most aggressive patches, but still:
+ * - Enable target discovery and auto-attach for page injection
+ * - Inject CDP detection hiding (navigator.webdriver, etc.)
+ */
+async function applyRealChromeStealthSetup(
+  connection: CDPConnection,
+  stealth: StealthConfig,
+  options: BrowserLaunchOptions,
+): Promise<void> {
+  const root = connection.rootSession;
+
+  // Discover existing targets
+  await root.send('Target.setDiscoverTargets', { discover: true });
+
+  // Do NOT override user-agent — the real Chrome's UA is legitimate and
+  // matches other headers/fingerprint data. Overriding it would create
+  // inconsistencies that bot detectors look for.
+
+  // Auto-attach to new pages for stealth injection
+  await root.send('Target.setAutoAttach', {
+    autoAttach: true,
+    waitForDebuggerOnStart: true,
+    flatten: true,
+  });
+
+  // Handle new target sessions — inject minimal stealth then resume
+  root.on('Target.attachedToTarget', async (params: any) => {
+    const { sessionId, targetInfo } = params;
+    if (targetInfo.type !== 'page') {
+      const session = (connection as any).sessions?.get(sessionId);
+      if (session) await session.sendMayFail('Runtime.runIfWaitingForDebugger');
+      return;
+    }
+
+    try {
+      const session = (connection as any).sessions?.get(sessionId);
+      if (session) {
+        // Still inject stealth scripts to hide CDP artifacts
+        // (navigator.webdriver, Runtime.enable detection, etc.)
+        await injectStealthScripts(session, stealth);
+        await session.send('Runtime.runIfWaitingForDebugger');
+      }
+    } catch (e) {
+      logger.warn('RealChrome', `Failed to inject stealth into session ${sessionId}: ${(e as Error).message}`);
+    }
+  });
+}
+
+// ─── Existing Connection Mode ────────────────────────────────
 
 async function connectToExisting(
   options: BrowserLaunchOptions,

@@ -12,10 +12,12 @@ import type {
   MacroToolResult,
   ToolContext,
   ToolDefinition,
+  TokenUsage,
 } from '../types.js';
 import { PageController } from '../actions/page-controller.js';
 import { createToolRegistry } from '../actions/tools.js';
 import { LLMClient, InvokeError } from './llm-client.js';
+import { ObserverClient } from './observer.js';
 import { SYSTEM_PROMPT, buildUserPrompt } from './prompt.js';
 import { logger } from '../utils/logger.js';
 import { uid, waitFor } from '../utils/helpers.js';
@@ -32,6 +34,7 @@ export class AgentCore {
 
   private status: AgentStatus = 'idle';
   private llm: LLMClient;
+  private observer?: ObserverClient;
   private abortController = new AbortController();
   private observations: string[] = [];
 
@@ -39,16 +42,18 @@ export class AgentCore {
     totalWaitTime: 0,
     lastURL: '',
     browserState: null as BrowserState | null,
+    tokens: { prompt: 0, completion: 0, total: 0 },
+    observerTokens: { prompt: 0, completion: 0, total: 0 },
   };
 
   constructor(config: AgentConfig, pageController: PageController) {
     this.config = config;
     this.pageController = pageController;
     this.llm = new LLMClient(config.llm);
+    if (config.observerLlm) {
+      this.observer = new ObserverClient(config.observerLlm);
+    }
     this.tools = createToolRegistry();
-
-    // Remove ask_user if no handler
-    // (will be set up externally if needed)
   }
 
   getStatus(): AgentStatus {
@@ -70,9 +75,10 @@ export class AgentCore {
    *
    * Loop:
    *   1. OBSERVE: Extract DOM state, detect changes
-   *   2. THINK: Call LLM with full context, get reflection + action
-   *   3. ACT: Execute the selected tool
-   *   4. Record history, loop
+   *   2. [SUMMARIZE]: Optional observer model compresses DOM to compact summary
+   *   3. THINK: Call actor LLM with context (full DOM or observer summary)
+   *   4. ACT: Execute the selected tool
+   *   5. Record history, loop
    */
   async execute(task: string): Promise<ExecutionResult> {
     if (!task) throw new Error('Task is required');
@@ -81,10 +87,17 @@ export class AgentCore {
     this.taskId = uid();
     this.history = [];
     this.observations = [];
-    this.states = { totalWaitTime: 0, lastURL: '', browserState: null };
+    this.states = {
+      totalWaitTime: 0,
+      lastURL: '',
+      browserState: null,
+      tokens: { prompt: 0, completion: 0, total: 0 },
+      observerTokens: { prompt: 0, completion: 0, total: 0 },
+    };
     this.status = 'running';
     this.abortController = new AbortController();
 
+    const fmt = (n: number) => n.toLocaleString();
     let step = 0;
 
     while (true) {
@@ -95,6 +108,27 @@ export class AgentCore {
         logger.info('Agent', '👀 Observing...');
         this.states.browserState = await this.pageController.getBrowserState();
         await this.handleObservations(step);
+
+        // ── SUMMARIZE (observer model, optional) ──────────────
+        let observerSummary: string | undefined;
+        let observerUsage: TokenUsage | undefined;
+
+        if (this.observer && this.states.browserState) {
+          logger.info('Agent', '🔭 Summarizing...');
+          const obs = await this.observer.summarize(this.states.browserState);
+          observerSummary = obs.summary;
+          observerUsage = obs.usage;
+
+          this.states.observerTokens.prompt += obs.usage.promptTokens;
+          this.states.observerTokens.completion += obs.usage.completionTokens;
+          this.states.observerTokens.total += obs.usage.totalTokens;
+
+          const cached = obs.usage.cachedTokens ? ` (${fmt(obs.usage.cachedTokens)} cached)` : '';
+          logger.info(
+            'Agent',
+            `🔭 Observer: +${fmt(obs.usage.promptTokens)} prompt / +${fmt(obs.usage.completionTokens)} completion${cached} → running observer total: ${fmt(this.states.observerTokens.total)}`,
+          );
+        }
 
         // ── THINK ─────────────────────────────────────────────
         logger.info('Agent', '🧠 Thinking...');
@@ -109,6 +143,7 @@ export class AgentCore {
           history: this.history as any,
           browserState: this.states.browserState!,
           instructions: this.config.instructions?.system,
+          observerSummary,
         });
 
         const messages = [
@@ -168,7 +203,31 @@ export class AgentCore {
             output: macroResult.output,
           },
           usage: result.usage,
+          observerUsage,
         });
+
+        // ── TOKEN TRACKING ────────────────────────────────────
+        if (result.usage) {
+          const u = result.usage;
+          this.states.tokens.prompt += u.promptTokens ?? 0;
+          this.states.tokens.completion += u.completionTokens ?? 0;
+          this.states.tokens.total += u.totalTokens ?? 0;
+          const cached = u.cachedTokens ? ` (${fmt(u.cachedTokens)} cached)` : '';
+
+          if (this.observer) {
+            logger.info(
+              'Agent',
+              `📊 Actor: +${fmt(u.promptTokens ?? 0)} prompt / +${fmt(u.completionTokens ?? 0)} completion${cached} → running actor total: ${fmt(this.states.tokens.total)}`,
+            );
+            const combined = this.states.tokens.total + this.states.observerTokens.total;
+            logger.info('Agent', `📊 Combined total so far: ${fmt(combined)}`);
+          } else {
+            logger.info(
+              'Agent',
+              `📊 Tokens: +${fmt(u.promptTokens ?? 0)} prompt / +${fmt(u.completionTokens ?? 0)} completion${cached} → total: ${fmt(this.states.tokens.prompt)} / ${fmt(this.states.tokens.completion)} / ${fmt(this.states.tokens.total)}`,
+            );
+          }
+        }
 
         // ── CHECK DONE ────────────────────────────────────────
         if (actionName === 'done') {
@@ -253,3 +312,4 @@ export class AgentCore {
     this.observations = [];
   }
 }
+

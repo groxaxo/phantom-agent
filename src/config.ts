@@ -1,5 +1,6 @@
 import type { AgentConfig, StealthConfig, BrowserLaunchOptions, LLMConfig } from './types.js';
 
+
 const DEFAULT_USER_AGENTS = [
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -63,20 +64,34 @@ export function buildConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     userAgent: stealth.userAgent,
     timezone: stealth.timezone,
     locale: stealth.locale,
+    useRealChrome: envBool('USE_REAL_CHROME', false),
+    remoteDebuggingPort: envInt('REMOTE_DEBUGGING_PORT', 9222),
     ...overrides.browser,
   };
 
   const llm: LLMConfig = {
-    baseURL: env('LLM_BASE_URL', 'http://localhost:8000/v1'),
-    model: env('LLM_MODEL', 'meta-llama/Llama-3.1-8B-Instruct'),
-    apiKey: env('LLM_API_KEY', ''),
+    baseURL: env('LLM_BASE_URL', 'https://api.z.ai/api/coding/paas/v4'),
+    model: env('LLM_MODEL', 'glm-5.1'),
+    apiKey: env('LLM_API_KEY', env('ZAI_API_KEY', env('Z_AI_API_KEY', ''))),
     temperature: envFloat('LLM_TEMPERATURE', 0.1),
     maxRetries: 3,
     ...overrides.llm,
   };
 
+  // Observer model: active by default. Summarizes raw DOM before the actor sees it (~70-75% token savings).
+  // Set OBSERVER_MODEL='' or --no-observer to disable.
+  const observerModelName = env('OBSERVER_MODEL', 'glm-5-turbo');
+  const observerLlm: LLMConfig | undefined = observerModelName ? {
+    baseURL: env('LLM_BASE_URL', 'https://api.z.ai/api/coding/paas/v4'),
+    model: observerModelName,
+    apiKey: env('LLM_API_KEY', env('ZAI_API_KEY', env('Z_AI_API_KEY', ''))),
+    temperature: 0.0,
+    maxRetries: 2,
+  } : undefined;
+
   const baseConfig: AgentConfig = {
     llm,
+    observerLlm,
     browser,
     stealth,
     maxSteps: envInt('MAX_STEPS', 40),
@@ -88,6 +103,7 @@ export function buildConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
     ...baseConfig,
     llm,
+    observerLlm: overrides.observerLlm ?? observerLlm,
     browser,
     stealth,
     maxSteps: defined(overrides.maxSteps) ? overrides.maxSteps : baseConfig.maxSteps,

@@ -194,13 +194,39 @@ export class LLMClient {
     let macroInput: MacroToolInput;
     try {
       macroInput = JSON.parse(toolCall.function.arguments);
+      // Handle models that stringify nested action field
+      if (typeof macroInput.action === 'string') {
+        try { macroInput.action = JSON.parse(macroInput.action); } catch {}
+      }
+      logger.info('LLM', `Macro input: ${JSON.stringify(macroInput).slice(0, 500)}`);
     } catch (e) {
       throw new InvokeError(InvokeErrorType.INVALID_TOOL_ARGS, 'Failed to parse tool arguments', e, data);
     }
 
     // Extract the action tool name and input
-    const actionName = Object.keys(macroInput.action)[0];
-    const actionInput = macroInput.action[actionName];
+    // Handle models that return oneOf choices as indexed objects: {"0": {toolName: ...}}
+    let actionName: string;
+    let actionInput: unknown;
+    const keys = Object.keys(macroInput.action);
+    if (keys.length === 1 && /^\d+$/.test(keys[0])) {
+      const inner = macroInput.action[keys[0]];
+      if (inner && typeof inner === 'object') {
+        const innerKeys = Object.keys(inner);
+        if (innerKeys.length === 1) {
+          actionName = innerKeys[0];
+          actionInput = inner[actionName];
+        } else {
+          actionName = keys[0];
+          actionInput = macroInput.action[keys[0]];
+        }
+      } else {
+        actionName = keys[0];
+        actionInput = macroInput.action[keys[0]];
+      }
+    } else {
+      actionName = keys[0];
+      actionInput = macroInput.action[keys[0]];
+    }
 
     if (!tools.has(actionName)) {
       throw new InvokeError(InvokeErrorType.INVALID_TOOL_ARGS, `Unknown tool: ${actionName}`, undefined, data);
@@ -318,8 +344,27 @@ export class LLMClient {
       throw new InvokeError(InvokeErrorType.INVALID_TOOL_ARGS, 'No action in parsed content');
     }
 
-    const actionName = Object.keys(macroInput.action)[0];
-    const actionInput = macroInput.action[actionName];
+    if (typeof macroInput.action === 'string') {
+      try { macroInput.action = JSON.parse(macroInput.action); } catch {}
+    }
+
+    const actionKeys = Object.keys(macroInput.action);
+    let actionName: string;
+    let actionInput: unknown;
+    if (actionKeys.length === 1 && /^\d+$/.test(actionKeys[0])) {
+      const inner = macroInput.action[actionKeys[0]];
+      if (inner && typeof inner === 'object') {
+        const innerKeys = Object.keys(inner);
+        actionName = innerKeys[0];
+        actionInput = inner[actionName];
+      } else {
+        actionName = actionKeys[0];
+        actionInput = macroInput.action[actionKeys[0]];
+      }
+    } else {
+      actionName = actionKeys[0];
+      actionInput = macroInput.action[actionKeys[0]];
+    }
 
     let output: string;
     try {
