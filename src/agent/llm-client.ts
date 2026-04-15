@@ -196,7 +196,25 @@ export class LLMClient {
       macroInput = JSON.parse(toolCall.function.arguments);
       // Handle models that stringify nested action field
       if (typeof macroInput.action === 'string') {
-        try { macroInput.action = JSON.parse(macroInput.action); } catch {}
+        try {
+          macroInput.action = JSON.parse(macroInput.action);
+        } catch {
+          // Action string is not valid JSON (model returned garbage like "execute_javascript离去={").
+          // Try extracting a leading tool name and reconstruct from top-level sibling fields.
+          const toolNameMatch = (macroInput.action as string).match(/^([a-z_]+)/);
+          if (toolNameMatch) {
+            const possibleToolName = toolNameMatch[1];
+            if (tools.has(possibleToolName)) {
+              const knownMacroFields = new Set(['evaluation_previous_goal', 'memory', 'next_goal', 'action']);
+              const toolInput: Record<string, unknown> = {};
+              for (const [k, v] of Object.entries(macroInput as Record<string, unknown>)) {
+                if (!knownMacroFields.has(k)) toolInput[k] = v;
+              }
+              logger.warn('LLM', `Recovered garbled action string → tool="${possibleToolName}" input=${JSON.stringify(toolInput)}`);
+              macroInput.action = { [possibleToolName]: toolInput };
+            }
+          }
+        }
       }
       logger.info('LLM', `Macro input: ${JSON.stringify(macroInput).slice(0, 500)}`);
     } catch (e) {
@@ -345,7 +363,22 @@ export class LLMClient {
     }
 
     if (typeof macroInput.action === 'string') {
-      try { macroInput.action = JSON.parse(macroInput.action); } catch {}
+      try {
+        macroInput.action = JSON.parse(macroInput.action);
+      } catch {
+        const toolNameMatch = (macroInput.action as string).match(/^([a-z_]+)/);
+        if (toolNameMatch) {
+          const possibleToolName = toolNameMatch[1];
+          if (tools.has(possibleToolName)) {
+            const knownMacroFields = new Set(['evaluation_previous_goal', 'memory', 'next_goal', 'action']);
+            const toolInput: Record<string, unknown> = {};
+            for (const [k, v] of Object.entries(macroInput as Record<string, unknown>)) {
+              if (!knownMacroFields.has(k)) toolInput[k] = v;
+            }
+            macroInput.action = { [possibleToolName]: toolInput };
+          }
+        }
+      }
     }
 
     const actionKeys = Object.keys(macroInput.action);

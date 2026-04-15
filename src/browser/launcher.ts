@@ -382,9 +382,12 @@ function createProfileWrapper(realDir: string, wrapperDir: string): string {
 
   mkdirSync(wrapperDir, { recursive: true });
 
-  // Symlink each entry in the real dir into the wrapper
+  // Entries that must NOT be symlinked — Chrome uses them for process locking
+  const SKIP_ENTRIES = new Set(['SingletonLock', 'SingletonSocket', 'SingletonCookie', 'lockfile']);
+
   const entries = readdirSync(realDir);
   for (const entry of entries) {
+    if (SKIP_ENTRIES.has(entry)) continue;
     const realPath = join(realDir, entry);
     const wrapperPath = join(wrapperDir, entry);
     try {
